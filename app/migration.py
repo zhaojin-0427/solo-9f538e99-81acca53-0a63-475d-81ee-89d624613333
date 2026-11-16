@@ -46,8 +46,11 @@ from .config import Settings
 from .db import connect, transaction
 from .schema import (
     WIDE_TABLE_SQL,
+    bump_revision,
     create_base_schema,
+    create_reconciliation_schema,
     drop_migration_triggers,
+    ensure_revision_tracking,
     ensure_wide_table,
     install_migration_triggers,
     replace_wide_table_with_view,
@@ -86,9 +89,13 @@ class MigrationEngine:
         try:
             with transaction(conn):
                 create_base_schema(conn)
+                create_reconciliation_schema(conn)
                 self._maybe_seed(conn)
                 ensure_wide_table(conn)
                 self._ensure_indexes(conn)
+                # Revision tracking must exist before any reconciliation can
+                # run, including on the still-legacy wide table.
+                ensure_revision_tracking(conn)
         finally:
             conn.close()
         if self.settings.auto_resume:
@@ -203,6 +210,8 @@ class MigrationEngine:
             try:
                 with transaction(conn):
                     create_base_schema(conn)
+                    create_reconciliation_schema(conn)
+                    ensure_revision_tracking(conn)
                     self._ensure_indexes(conn)
                     row = conn.execute(
                         "SELECT * FROM migration_state WHERE id = 1"
@@ -453,6 +462,11 @@ class MigrationEngine:
                     )
                 drop_migration_triggers(conn)
                 replace_wide_table_with_view(conn)
+                # The cutover itself is a committed change of the logical
+                # samples dataset: any reconciliation snapshot taken before it
+                # must be rejected at publish.  Explicit bump because the
+                # long-table catch-up above does not fire the samples triggers.
+                bump_revision(conn)
                 conn.execute(
                     "UPDATE migration_state SET state='completed',"
                     " completed_at=?, last_error=NULL,"

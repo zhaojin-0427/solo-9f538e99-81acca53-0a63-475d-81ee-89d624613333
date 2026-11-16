@@ -95,6 +95,9 @@ BEGIN
            END
     FROM _insert_context AS c
     CROSS JOIN (SELECT 'temperature' AS metric UNION ALL SELECT 'ph') AS m;
+
+    UPDATE db_revision SET revision = revision + 1,
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = 1;
 END
 """
 
@@ -123,6 +126,9 @@ BEGIN
     FROM (SELECT 'temperature' AS metric UNION ALL SELECT 'ph') AS m
     WHERE NEW.id IS NOT NULL
     ON CONFLICT (sample_id, metric) DO UPDATE SET value = excluded.value;
+
+    UPDATE db_revision SET revision = revision + 1,
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = 1;
 END
 """
 
@@ -130,6 +136,9 @@ COMPAT_DELETE_TRIGGER_SQL = """
 CREATE TRIGGER samples_delete INSTEAD OF DELETE ON samples
 BEGIN
     DELETE FROM sample_metrics WHERE sample_id = OLD.id;
+
+    UPDATE db_revision SET revision = revision + 1,
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = 1;
 END
 """
 
@@ -189,6 +198,147 @@ CREATE TABLE samples (
     ph REAL
 )
 """
+
+# ------------------------------------------------------------------- revision
+# Monotonic counter bumped by *every committed write* to the logical samples
+# dataset.  Reconciliation jobs record the revision they started from and
+# re-check it at publish time: any committed write in between (even one that
+# changes a value back to the original) makes the report unpublishable.
+DB_REVISION_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS db_revision (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    revision   INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT
+)
+"""
+
+# Timestamps inside trigger bodies cannot use bound parameters.
+_BUMP_REVISION_SQL = (
+    "UPDATE db_revision SET revision = revision + 1,"
+    " updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = 1"
+)
+
+# Wide-table revision triggers.  Installed at startup (not only when a
+# migration starts) so reconciliation is available before migration too.
+# They are dropped automatically with the table at cutover; the compatibility
+# view triggers below take over afterwards.
+REVISION_TRIGGERS = (
+    f"""
+    CREATE TRIGGER IF NOT EXISTS _revision_samples_insert
+    AFTER INSERT ON samples
+    BEGIN
+        {_BUMP_REVISION_SQL};
+    END
+    """,
+    f"""
+    CREATE TRIGGER IF NOT EXISTS _revision_samples_update
+    AFTER UPDATE ON samples
+    BEGIN
+        {_BUMP_REVISION_SQL};
+    END
+    """,
+    f"""
+    CREATE TRIGGER IF NOT EXISTS _revision_samples_delete
+    AFTER DELETE ON samples
+    BEGIN
+        {_BUMP_REVISION_SQL};
+    END
+    """,
+)
+
+
+# -------------------------------------------------------- reconciliation store
+RECONCILIATION_SCHEMA_SQL = (
+    """
+    CREATE TABLE IF NOT EXISTS reconciliation_runs (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_uid            TEXT    NOT NULL UNIQUE,
+        status             TEXT    NOT NULL
+                           CHECK (status IN
+                             ('pending', 'published', 'aborted', 'failed')),
+        requested_at       TEXT    NOT NULL,
+        started_at         TEXT,
+        finished_at        TEXT,
+        base_revision      INTEGER NOT NULL,
+        final_revision     INTEGER,
+        published_revision INTEGER,
+        manifest_count     INTEGER NOT NULL,
+        source             TEXT,
+        stale              INTEGER NOT NULL DEFAULT 0,
+        failure_reason     TEXT,
+        diff_manifest_only INTEGER NOT NULL DEFAULT 0,
+        diff_database_only INTEGER NOT NULL DEFAULT 0,
+        diff_value_mismatch INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    # Staging area for the incoming manifest.  Rows are kept for published
+    # reports (audit) and deleted for aborted / failed runs, so no half result
+    # ever remains observable.
+    """
+    CREATE TABLE IF NOT EXISTS reconciliation_manifest (
+        run_id       INTEGER NOT NULL,
+        sample_id    INTEGER NOT NULL,
+        temperature  REAL,
+        ph           REAL,
+        temp_present INTEGER NOT NULL,
+        ph_present   INTEGER NOT NULL,
+        PRIMARY KEY (run_id, sample_id)
+    ) WITHOUT ROWID
+    """,
+    # Persisted diff rows, one per disagreeing sample id.  The UNIQUE
+    # constraint also provides the (run_id, sample_id) index used by the
+    # keyset-paginated diff reader.
+    """
+    CREATE TABLE IF NOT EXISTS reconciliation_diffs (
+        id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id                   INTEGER NOT NULL,
+        sample_id                INTEGER NOT NULL,
+        diff_type                TEXT    NOT NULL
+                                 CHECK (diff_type IN
+                                   ('manifest_only', 'database_only',
+                                    'value_mismatch')),
+        manifest_temperature     REAL,
+        manifest_ph              REAL,
+        manifest_temp_present    INTEGER NOT NULL,
+        manifest_ph_present      INTEGER NOT NULL,
+        database_temperature     REAL,
+        database_ph              REAL,
+        UNIQUE (run_id, sample_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_recon_diffs_run_id"
+    " ON reconciliation_diffs(run_id, sample_id)",
+)
+
+
+def bump_revision(conn) -> None:
+    """Advance the committed-write counter (caller holds a write tx)."""
+    conn.execute(_BUMP_REVISION_SQL)
+
+
+def ensure_revision_tracking(conn) -> None:
+    """Create the revision counter and wide-table triggers if needed.
+
+    After cutover ``samples`` is a view: only the counter row is (re)created
+    here -- the INSTEAD OF triggers installed with the view carry the bumps.
+    """
+    conn.execute(DB_REVISION_TABLE_SQL)
+    conn.execute(
+        "INSERT OR IGNORE INTO db_revision (id, revision, updated_at)"
+        " VALUES (1, 0, strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+    )
+    row = conn.execute(
+        "SELECT type FROM sqlite_master WHERE name = 'samples'"
+    ).fetchone()
+    if row is not None and row["type"] == "table":
+        for sql in REVISION_TRIGGERS:
+            conn.execute(sql)
+
+
+def create_reconciliation_schema(conn) -> None:
+    """Create reconciliation bookkeeping tables (idempotent)."""
+    for sql in RECONCILIATION_SCHEMA_SQL:
+        conn.execute(sql)
 
 
 def create_base_schema(conn) -> None:

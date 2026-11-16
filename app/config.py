@@ -25,6 +25,9 @@ class Settings:
     chunk_delay_ms: int = 100
     busy_timeout_ms: int = 30_000
     auto_resume: bool = True
+    reconciliation_max_entries: int = 5000
+    reconciliation_chunk_size: int = 500
+    reconciliation_diff_page_max: int = 1000
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -39,4 +42,13 @@ class Settings:
             busy_timeout_ms=max(1000, _env_int("SQLITE_BUSY_TIMEOUT_MS", 30_000)),
             auto_resume=os.environ.get("AUTO_RESUME", "true").lower()
             not in {"0", "false", "no"},
+            reconciliation_max_entries=max(
+                1, _env_int("RECONCILIATION_MAX_ENTRIES", 5000)
+            ),
+            reconciliation_chunk_size=max(
+                1, _env_int("RECONCILIATION_CHUNK_SIZE", 500)
+            ),
+            reconciliation_diff_page_max=max(
+                1, _env_int("RECONCILIATION_DIFF_PAGE_MAX", 1000)
+            ),
         )
